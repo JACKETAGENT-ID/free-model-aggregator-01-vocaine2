@@ -1197,33 +1197,38 @@ def parse_anthropic_answer(raw, stream, model):
     return _anthropic_answer_json(ans, raw)
 
 
+def _gemini_absorb(ans, body):
+    # Fold one Gemini response (or one streamed chunk of one) into
+    # the canonical answer: text concatenates, function calls become
+    # tool calls, and finish/usage overwrite when present.
+    candidates = body.get("candidates") or []
+    candidate = candidates[0] if candidates and _is_record(candidates[0]) else {}
+    content = candidate.get("content") or {}
+    for part in content.get("parts") or []:
+        if not _is_record(part):
+            continue
+        if isinstance(part.get("text"), str):
+            ans["text"] += part["text"]
+        elif _is_record(part.get("functionCall")):
+            function = part["functionCall"]
+            ans["tool_calls"].append({
+                "id": "",
+                "name": function.get("name") or "",
+                "arguments": json.dumps(function.get("args") or {}),
+            })
+    if candidate.get("finishReason") is not None:
+        ans["family"] = STOP_FAMILY.get(candidate.get("finishReason"), 0)
+    usage = body.get("usageMetadata") or {}
+    if usage:
+        ans["usage_in"] = _num(usage.get("promptTokenCount"))
+        ans["usage_out"] = _num(usage.get("candidatesTokenCount"))
+
+
 def parse_gemini_answer(raw, stream, model):
     ans = _empty_answer(model)
-
-    def absorb(body):
-        cands = body.get("candidates") or []
-        cand = cands[0] if cands and _is_record(cands[0]) else {}
-        content = cand.get("content") or {}
-        for part in content.get("parts") or []:
-            if not _is_record(part):
-                continue
-            if isinstance(part.get("text"), str):
-                ans["text"] += part["text"]
-            elif _is_record(part.get("functionCall")):
-                fn = part["functionCall"]
-                ans["tool_calls"].append({
-                    "id": "", "name": fn.get("name") or "",
-                    "arguments": json.dumps(fn.get("args") or {})})
-        if cand.get("finishReason") is not None:
-            ans["family"] = STOP_FAMILY.get(cand.get("finishReason"), 0)
-        usage = body.get("usageMetadata") or {}
-        if usage:
-            ans["usage_in"] = _num(usage.get("promptTokenCount"))
-            ans["usage_out"] = _num(usage.get("candidatesTokenCount"))
-
     if not stream:
         try:
-            absorb(json.loads(raw.decode("utf-8")))
+            _gemini_absorb(ans, json.loads(raw.decode("utf-8")))
         except ValueError:
             pass
         return ans
@@ -1233,106 +1238,179 @@ def parse_gemini_answer(raw, stream, model):
         except ValueError:
             continue
         if _is_record(body):
-            absorb(body)
+            _gemini_absorb(ans, body)
     return ans
+
+
+def _usage_ints(ans):
+    # The answer's usage as plain ints, missing values counting as 0.
+    used_in = int(ans["usage_in"]) if ans["usage_in"] is not None else 0
+    used_out = int(ans["usage_out"]) if ans["usage_out"] is not None else 0
+    return used_in, used_out
 
 
 def render_openai_answer(ans, model):
     message = {"role": "assistant", "content": ans["text"]}
     if ans["tool_calls"]:
         message["tool_calls"] = [{
-            "id": c["id"] or "call_%d" % i, "type": "function",
-            "function": {"name": c["name"], "arguments": c["arguments"]}}
-            for i, c in enumerate(ans["tool_calls"])]
-    usage_in = int(ans["usage_in"]) if ans["usage_in"] is not None else 0
-    usage_out = int(ans["usage_out"]) if ans["usage_out"] is not None else 0
-    return {"id": "chatcmpl-" + (ans["resp_id"] or "aggregate"),
-            "object": "chat.completion", "created": FIXED_CREATED, "model": model,
-            "choices": [{"index": 0, "message": message,
-                         "finish_reason": OPENAI_FINISH[ans["family"]]}],
-            "usage": {"prompt_tokens": usage_in, "completion_tokens": usage_out,
-                      "total_tokens": usage_in + usage_out}}
+            "id": call["id"] or "call_%d" % i,
+            "type": "function",
+            "function": {"name": call["name"], "arguments": call["arguments"]},
+        } for i, call in enumerate(ans["tool_calls"])]
+    used_in, used_out = _usage_ints(ans)
+    return {
+        "id": "chatcmpl-" + (ans["resp_id"] or "aggregate"),
+        "object": "chat.completion",
+        "created": FIXED_CREATED,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": OPENAI_FINISH[ans["family"]],
+        }],
+        "usage": {
+            "prompt_tokens": used_in,
+            "completion_tokens": used_out,
+            "total_tokens": used_in + used_out,
+        },
+    }
+
+
+def _arguments_object(call):
+    # A tool call's arguments string read back as an object.
+    if not call["arguments"]:
+        return {}
+    try:
+        parsed = json.loads(call["arguments"])
+    except ValueError:
+        return {}
+    return parsed if _is_record(parsed) else {}
 
 
 def render_anthropic_answer(ans, model):
+    # The text block is present whenever there is text -- and also
+    # when there are no tool calls at all, so the content is never
+    # empty.
     content = []
-    if ans["text"] or not ans["tool_calls"]:
+    if ans["text"] != "" or not ans["tool_calls"]:
         content.append({"type": "text", "text": ans["text"]})
     for i, call in enumerate(ans["tool_calls"]):
-        try:
-            parsed = json.loads(call["arguments"]) if call["arguments"] else {}
-        except ValueError:
-            parsed = {}
-        content.append({"type": "tool_use", "id": call["id"] or "toolu_%d" % i,
-                        "name": call["name"],
-                        "input": parsed if _is_record(parsed) else {}})
-    return {"id": "msg_" + (ans["resp_id"] or "aggregate"), "type": "message",
-            "role": "assistant", "model": model, "content": content,
-            "stop_reason": ANTHROPIC_STOP[ans["family"]], "stop_sequence": None,
-            "usage": {"input_tokens": int(ans["usage_in"]) if ans["usage_in"] is not None else 0,
-                      "output_tokens": int(ans["usage_out"]) if ans["usage_out"] is not None else 0}}
+        content.append({
+            "type": "tool_use",
+            "id": call["id"] or "toolu_%d" % i,
+            "name": call["name"],
+            "input": _arguments_object(call),
+        })
+    used_in, used_out = _usage_ints(ans)
+    return {
+        "id": "msg_" + (ans["resp_id"] or "aggregate"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": ANTHROPIC_STOP[ans["family"]],
+        "stop_sequence": None,
+        "usage": {"input_tokens": used_in, "output_tokens": used_out},
+    }
 
 
 def _sse(data, event=None):
-    return ((("event: %s\n" % event) if event else "")
-            + "data: %s\n\n" % json.dumps(data))
+    head = "event: %s\n" % event if event else ""
+    return head + "data: %s\n\n" % json.dumps(data)
 
 
 def render_openai_stream(ans, model):
-    base = {"id": "chatcmpl-" + (ans["resp_id"] or "aggregate"),
-            "object": "chat.completion.chunk", "created": FIXED_CREATED, "model": model}
-    out = [_sse({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
-                                      "finish_reason": None}]})]
-    if ans["text"]:
-        out.append(_sse({**base, "choices": [{"index": 0, "delta": {"content": ans["text"]},
-                                              "finish_reason": None}]}))
+    # The whole answer as one OpenAI chunk sequence: role chunk, one
+    # text chunk, one chunk per tool call, finish chunk, usage chunk.
+    base = {
+        "id": "chatcmpl-" + (ans["resp_id"] or "aggregate"),
+        "object": "chat.completion.chunk",
+        "created": FIXED_CREATED,
+        "model": model,
+    }
+
+    def chunk(delta, finish=None, usage=None):
+        frame = dict(base)
+        frame["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish}]
+        if usage is not None:
+            frame["choices"] = []
+            frame["usage"] = usage
+        return _sse(frame)
+
+    out = [chunk({"role": "assistant", "content": ""})]
+    if ans["text"] != "":
+        out.append(chunk({"content": ans["text"]}))
     for i, call in enumerate(ans["tool_calls"]):
-        out.append(_sse({**base, "choices": [{"index": 0, "delta": {"tool_calls": [{
-            "index": i, "id": call["id"] or "call_%d" % i, "type": "function",
-            "function": {"name": call["name"], "arguments": call["arguments"]}}]},
-            "finish_reason": None}]}))
-    out.append(_sse({**base, "choices": [{"index": 0, "delta": {},
-                                          "finish_reason": OPENAI_FINISH[ans["family"]]}]}))
-    usage_in = int(ans["usage_in"]) if ans["usage_in"] is not None else 0
-    usage_out = int(ans["usage_out"]) if ans["usage_out"] is not None else 0
-    out.append(_sse({**base, "choices": [], "usage": {
-        "prompt_tokens": usage_in, "completion_tokens": usage_out,
-        "total_tokens": usage_in + usage_out}}))
+        out.append(chunk({"tool_calls": [{
+            "index": i,
+            "id": call["id"] or "call_%d" % i,
+            "type": "function",
+            "function": {"name": call["name"], "arguments": call["arguments"]},
+        }]}))
+    out.append(chunk({}, finish=OPENAI_FINISH[ans["family"]]))
+    used_in, used_out = _usage_ints(ans)
+    out.append(chunk({}, usage={
+        "prompt_tokens": used_in,
+        "completion_tokens": used_out,
+        "total_tokens": used_in + used_out,
+    }))
     out.append("data: [DONE]\n\n")
     return "".join(out).encode("utf-8")
 
 
 def render_anthropic_stream(ans, model):
-    usage_in = int(ans["usage_in"]) if ans["usage_in"] is not None else 0
-    usage_out = int(ans["usage_out"]) if ans["usage_out"] is not None else 0
-    out = [_sse({"type": "message_start", "message": {
-        "id": "msg_" + (ans["resp_id"] or "aggregate"), "type": "message",
-        "role": "assistant", "model": model, "content": [], "stop_reason": None,
-        "stop_sequence": None,
-        "usage": {"input_tokens": usage_in, "output_tokens": 0}}}, "message_start")]
+    # The whole answer as an Anthropic event sequence: message_start,
+    # a text block when there is text or no tool call, one block per
+    # tool call, then message_delta and message_stop.
+    used_in, used_out = _usage_ints(ans)
+    out = [_sse({
+        "type": "message_start",
+        "message": {
+            "id": "msg_" + (ans["resp_id"] or "aggregate"),
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [],
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": used_in, "output_tokens": 0},
+        },
+    }, "message_start")]
     index = 0
-    if ans["text"] or not ans["tool_calls"]:
-        out.append(_sse({"type": "content_block_start", "index": index,
-                         "content_block": {"type": "text", "text": ""}}, "content_block_start"))
-        if ans["text"]:
-            out.append(_sse({"type": "content_block_delta", "index": index,
-                             "delta": {"type": "text_delta", "text": ans["text"]}},
-                            "content_block_delta"))
+    if ans["text"] != "" or not ans["tool_calls"]:
+        out.append(_sse({
+            "type": "content_block_start", "index": index,
+            "content_block": {"type": "text", "text": ""},
+        }, "content_block_start"))
+        if ans["text"] != "":
+            out.append(_sse({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "text_delta", "text": ans["text"]},
+            }, "content_block_delta"))
         out.append(_sse({"type": "content_block_stop", "index": index}, "content_block_stop"))
         index += 1
     for i, call in enumerate(ans["tool_calls"]):
-        out.append(_sse({"type": "content_block_start", "index": index, "content_block": {
-            "type": "tool_use", "id": call["id"] or "toolu_%d" % i,
-            "name": call["name"], "input": {}}}, "content_block_start"))
-        if call["arguments"]:
-            out.append(_sse({"type": "content_block_delta", "index": index, "delta": {
-                "type": "input_json_delta", "partial_json": call["arguments"]}},
-                "content_block_delta"))
+        out.append(_sse({
+            "type": "content_block_start", "index": index,
+            "content_block": {
+                "type": "tool_use",
+                "id": call["id"] or "toolu_%d" % i,
+                "name": call["name"],
+                "input": {},
+            },
+        }, "content_block_start"))
+        if call["arguments"] != "":
+            out.append(_sse({
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": call["arguments"]},
+            }, "content_block_delta"))
         out.append(_sse({"type": "content_block_stop", "index": index}, "content_block_stop"))
         index += 1
-    out.append(_sse({"type": "message_delta", "delta": {
-        "stop_reason": ANTHROPIC_STOP[ans["family"]], "stop_sequence": None},
-        "usage": {"output_tokens": usage_out}}, "message_delta"))
+    out.append(_sse({
+        "type": "message_delta",
+        "delta": {"stop_reason": ANTHROPIC_STOP[ans["family"]], "stop_sequence": None},
+        "usage": {"output_tokens": used_out},
+    }, "message_delta"))
     out.append(_sse({"type": "message_stop"}, "message_stop"))
     return "".join(out).encode("utf-8")
 
